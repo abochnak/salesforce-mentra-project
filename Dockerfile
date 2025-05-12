@@ -38,5 +38,5 @@ USER appuser
 COPY . .
 
 # Run the application
-EXPOSE 8080
-ENTRYPOINT ["gunicorn", "--bind=0.0.0.0:8080", "-w=1", "--threads=1", "-c=gunicorn_wsgi.py", "app:app"]
+EXPOSE 7860
+ENTRYPOINT ["python3", "app.py"]

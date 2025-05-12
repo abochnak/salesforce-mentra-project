@@ -70,7 +70,7 @@ geminiClient = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODEL = "gemini-2.0-flash"
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s %(levelname)-8s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S')
 
@@ -165,4 +165,4 @@ Given a health procedure, insurance provider, and location, HealthPT provides a 
         with gr.Column():
             output.render()
 
-demo.launch()
+demo.launch(server_port=7860)
