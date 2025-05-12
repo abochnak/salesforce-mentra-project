@@ -2,3 +2,4 @@
 .mm/*
 .monarch_session
 *.pyc
+.env

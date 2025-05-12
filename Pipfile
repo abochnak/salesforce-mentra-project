@@ -9,6 +9,8 @@ gunicorn = "*"
 prometheus-flask-exporter = "*"
 arrow = "*"
 flask = {extras = ["async"], version = "*"}
+gradio = "*"
+google-genai = "*"
 
 [dev-packages]
 
