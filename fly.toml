@@ -8,6 +8,9 @@ primary_region = 'iad'
 
 [build]
 
+[processes]
+app = "/home/appuser/app.py"
+
 [http_service]
   internal_port = 7860
   force_https = true

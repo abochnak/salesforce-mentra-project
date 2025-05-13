@@ -401,4 +401,4 @@ Given a health procedure, insurance provider, and location, HealthPT provides a 
         with gr.Column():
             output.render()
 
-demo.launch(server_port=7860)
+demo.launch(server_port=7860, server_name="0.0.0.0")
