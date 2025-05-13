@@ -3,19 +3,27 @@
 import os
 import arrow
 import logging
+import math
 import json
 import requests
 import time
 import asyncio
 import collections
 import gradio as gr
-from typing import Optional
+import urllib.parse
+from typing import List, Optional, Union
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
-from utils.metadata import zip_to_city, insurance_names, procedure_summaries_map, procedure_primary_summary, substr_list_filter, substr_map_filter
+from utils.metadata import zip_to_city, zip_to_latlng, insurance_names, procedure_summaries_map, procedure_primary_summary, substr_list_filter, substr_map_filter
+
+class TrueFalseOrNone(BaseModel):
+    response: Optional[bool]
 
 class ProcedureInsuranceLocationSchema(BaseModel):
+    '''
+    One or more of health_procedure_name, health_insurance_name, or location_for_procedure.
+    '''
     health_procedure_name: Optional[str]
     health_insurance_name: Optional[str]
     location_for_procedure: Optional[str]
@@ -85,28 +93,87 @@ with gr.Blocks() as demo:
         return ret
         
 
-    def fetch_dataset_rows():
-        _procedures = substr_map_filter(procedure_summaries_map, procedure.value)
-        _procedure_filter = f"service={_procedures[0]}" if len(_procedures) == 1 else ""
-        _insurances = substr_list_filter(insurance_names, insurance.value)
-        _insurance_filter = f"plan_raw={_insurances[0]}" if len(_insurances) == 1 else ""
-        _locations = [str(i) for i in substr_map_filter(zip_to_city, location.value)]
-        _zip_filter = f"zip_code={_locations[0]}" if len(_locations) == 1 else ""
+    def raw_fetch_dataset(procedure_val, insurance_val, location_val):
+        _procedures = substr_map_filter(procedure_summaries_map, procedure_val)
+        _procedure_filter = f"service={_procedures[0]}" if _procedures and len(_procedures) == 1 else ""
+        _insurances = substr_list_filter(insurance_names, insurance_val)
+        _insurance_filter = f"plan_raw={_insurances[0]}" if _insurances and len(_insurances) == 1 else ""
+        _locations = [str(i) for i in substr_map_filter(zip_to_city, location_val)]
+        _zip_filter = f"zip_code={_locations[0]}" if _locations and len(_locations) == 1 else ""
         _filter = "&".join(filter(None, [_procedure_filter, _insurance_filter, _zip_filter]))
         logger.info(f"Querying: {BACKEND_ENDPOINT}?{_filter}")
         full_data = requests.get(f"{BACKEND_ENDPOINT}?{_filter}").json()
         ret = []
         for item in full_data.get("data"):
-            if not item["service"] in _procedures:
-                continue
-            if not item["plan_raw"] in _insurances:
-                continue
-            if not str(item["zip_code"]) in _locations:
-                continue
+            if _procedures:
+                if not item["service"] in _procedures:
+                    continue
+            if _insurances:
+                if not item["plan_raw"] in _insurances:
+                    continue
+            if _locations:
+                if not str(item["zip_code"]) in _locations:
+                    continue
             ret.append(item)
         _deduped = _dedup_rows(ret)
         logger.info(f"Query for {_filter} returned {len(ret)} rows, {len(_deduped)} after dedup: {_deduped}")
         return _deduped
+
+    def fetch_dataset_rows():
+        return raw_fetch_dataset(procedure.value, insurance.value, location.value)
+    
+    def calculate_distance(latlng_a, latlng_b):
+        def _calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+            # Haversine formula, returning miles
+            R_km = 6371.0
+            dlat = math.radians(lat2 - lat1)
+            dlon = math.radians(lon2 - lon1)
+
+            a = (math.sin(dlat / 2) ** 2 +
+                math.cos(math.radians(lat1)) *
+                math.cos(math.radians(lat2)) *
+                math.sin(dlon / 2) ** 2)
+
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            distance_km = R_km * c
+
+            return distance_km * 0.6213712
+        return _calculate_distance(latlng_a["latitude"], latlng_a["longitude"], latlng_b["latitude"], latlng_b["longitude"])
+
+    def closest_other_locations_to(location_name: str) -> List[str]:
+        loc_latlng = None
+        for z, c in zip_to_city.items():
+            if c.lower() == location_name.lower():
+                loc_latlng = zip_to_latlng.get(z)
+        if not loc_latlng:
+            return []
+        dists = []
+        for z, c in zip_to_city.items():
+            if c.lower() == location_name.lower():
+                continue
+            cur_latlng = zip_to_latlng.get(z)
+            _dist = calculate_distance(loc_latlng, cur_latlng)
+            _skip = None
+            for oo in dists:
+                if oo[1].lower() == c.lower():
+                    if oo[0] <= _dist:
+                        _skip = True
+                    else:
+                        del oo
+            
+            if _skip:
+                continue
+                    
+            dists.append((_dist, c))
+        dists.sort()
+        return [i[1] for i in dists[:3]]
+        
+    def all_locations_in_dataset() -> List[str]:
+        return list(set(zip_to_city.values()))
+
+    def get_travel_directions_to(street_address: str) -> str:
+        """Returns travel directions to the given street address for a location."""
+        return f"[Get travel directions to {street_address}](https://www.google.com/maps/place/{urllib.parse.quote(street_address)})"
 
     def _dedup_rows(pre_result):
         prov_to_rows = collections.defaultdict(list)
@@ -153,32 +220,36 @@ with gr.Blocks() as demo:
                     continue
                 elif item.get("role") == "assistant":
                     gem_history.append({"role": "model", "parts": [{"text": item["content"]}]})
-        if message:
-            gem_history.append({"role": "user", "parts": [{"text": message}]})
         if result_md:
             gem_history.append({"role": "model", "parts": [{"text": result_md}]})
+        if message:
+            gem_history.append({"role": "user", "parts": [{"text": message}]})
         return gem_history
+    
+    def gemini_yn_intent(message):
+        gemini_response = geminiClient.models.generate_content(
+            model=MODEL,
+            config=types.GenerateContentConfig(
+                system_instruction="Interpret the user's response as one of: True, False, or None.",
+                response_mime_type="application/json",
+                response_schema=TrueFalseOrNone
+            ),
+            contents=message,
+        )
+
+        p = gemini_response.parsed
+        if p:
+            return p.response
+        return None
 
     def respond(message, history):
         logger.info(f"respond(message={message}, history={history})")
         response = None
         _yes = "Looks good!"
         _no = "That's not right."
-        if not history or not procedure.value or not insurance.value or not location.value or confirmed.value is False:
-            # Initial message for getting the fields
-            yield "Using Gemini...", build_output()
-            gemini_response = geminiClient.models.generate_content(
-                model=MODEL,
-                config=types.GenerateContentConfig(
-                    system_instruction="You are HealthPT: GPT-powered Healthcare Cost Analysis. Given a health procedure, insurance provider, and location, HealthPT performs an estimated cost analysis from its dataset. You need to perform the first step which is just processing the user's input.",
-                    response_mime_type="application/json",
-                    response_schema=ProcedureInsuranceLocationSchema
-                ),
-                contents=message,
-            )
-            print(f"Gemini response: {gemini_response.text}")
+    
+        def process_procedure_request(gemini_response):
             no_match = []
-            gemini_response: ProcedureInsuranceLocationSchema = gemini_response.parsed
             if gemini_response.health_procedure_name:
                 procedure.value = gemini_response.health_procedure_name
                 if not substr_map_filter(procedure_summaries_map, procedure.value):
@@ -215,9 +286,27 @@ with gr.Blocks() as demo:
                         ]
                     )
                     confirmed.value = None
+            return response
+
+        if not history or not procedure.value or not insurance.value or not location.value or confirmed.value is False:
+            # Initial message for getting the fields
+            yield "Using Gemini...", build_output()
+            gemini_response = geminiClient.models.generate_content(
+                model=MODEL,
+                config=types.GenerateContentConfig(
+                    system_instruction="You are HealthPT: GPT-powered Healthcare Cost Analysis. Given a health procedure, insurance provider, and location, HealthPT performs an estimated cost analysis from its dataset. You need to perform the first step which is just processing the user's input.",
+                    response_mime_type="application/json",
+                    response_schema=ProcedureInsuranceLocationSchema
+                ),
+                contents=message,
+            )
+            print(f"Gemini response: {gemini_response.text}")
+            
+            gemini_response: ProcedureInsuranceLocationSchema = gemini_response.parsed
+            response = yield from process_procedure_request(gemini_response)
         
         elif confirmed.value is None:
-            if message == _yes:
+            if message == _yes or (message != _no and gemini_yn_intent(message) is True):
                 confirmed.value = True
                 yield "Great! I'm summarizing this with Gemini...", build_output()
                 _gemini_input = f"Summarize the following. Do NOT use bullet points. Write a single paragraph. My initial question was: {history_to_gemini_fmt(history)[0].get("parts")[0].get("text")}\n\n{build_output(no_markdown=True)}"
@@ -232,28 +321,62 @@ with gr.Blocks() as demo:
                 )
                 logger.info(f"Gemini response: {gemini_response}")
                 response = gemini_response.text
+                response = gr.ChatMessage(
+                    content = response,
+                    options = [
+                        {"value": "What other options are nearby?"},
+                        {"value": "Give travel directions to the cheapest option."}
+                    ]
+                )
 
-            elif message == _no:
+            elif message == _no or gemini_yn_intent(message) is False:
                 confirmed.value = False
-                response = "OK, let's try again... what needs to be corrected?"
+                if message != _no:
+                    response = "OK, let's try again... what needs to be corrected?"
+                else:
+                    response = "OK, let's try again... what needs to be corrected?"
         else:
             yield "Asking Gemini...", build_output()
-            _gemini_input = history_to_gemini_fmt(history, message=f"{message}: {build_output(no_markdown=True)}")[-6:]
+            _gemini_input = history_to_gemini_fmt(history, message=f"{message}", result_md=build_output(no_markdown=True))[-6:]
             logger.info(f"Gemini followup input: {_gemini_input}")
-            was_changed = [False]
-            def change_search_parameters(health_procedure_name: Optional[str], health_insurance_name: Optional[str], location_for_procedure: Optional[str]):
-                was_changed[0] = True
+            was_changed = [None]
+            def change_search_parameters(change_schema: ProcedureInsuranceLocationSchema):
+                logger.info(f"Gemini change search parameters: {change_schema}")
+
+                was_changed[0] = change_schema
+
+                return 'done!'
+            gemini_response = None
+            while gemini_response is None:
+                def change_procedure(procedure: str):
+                    return change_search_parameters(ProcedureInsuranceLocationSchema(health_procedure_name=procedure, health_insurance_name=insurance.value, location_for_procedure=location.value))
+                def change_insurance(insurance: str):
+                    return change_search_parameters(ProcedureInsuranceLocationSchema(health_insurance_name=insurance, health_procedure_name=procedure.value, location_for_procedure=location.value))
+                def change_location(location: str):
+                    return change_search_parameters(ProcedureInsuranceLocationSchema(location_for_procedure=location, health_procedure_name=procedure.value, health_insurance_name=insurance.value))
+                gemini_response = geminiClient.models.generate_content(
+                    model=MODEL,
+                    config=types.GenerateContentConfig(
+                        system_instruction="""You are HealthPT: GPT-powered Healthcare Cost Analysis. Given a health procedure, insurance provider, and location, HealthPT analyzes the cost information from the provided data in a conversational interface, allowing the user to ask follow-up questions.
+
+                        Call 'change_procedure' to change the health procedure, 'change_insurance' to change insurance, or 'change_location' to change location.
+                        Call 'closest_other_locations_to' to identify other nearby locations and do so without prompting. 
+                        Call 'get_travel_directions_to' to get travel directions which should then be shared with the user.
+                        
+                        ALWAYS continue the conversation after a function call, and call functions without asking for confirmation.
+                        """,
+                        tools=[change_procedure, change_insurance, change_location, all_locations_in_dataset, closest_other_locations_to, get_travel_directions_to],
+                        
+                    ),
+                    contents=_gemini_input
+                )
+                logger.info(f"Gemini followup response: {gemini_response.text=} {gemini_response=}")
+                if was_changed[0]:
+                    response = yield from process_procedure_request(was_changed[0])
+                else:
+                    response = gemini_response.text
                 
-            gemini_response = geminiClient.models.generate_content(
-                model=MODEL,
-                config=types.GenerateContentConfig(
-                    system_instruction="You are HealthPT: GPT-powered Healthcare Cost Analysis. Given a health procedure, insurance provider, and location, HealthPT analyzes the cost information from the provided data in a conversational interface, allowing the user to ask follow-up questions. Answer the user's question directly.",
-                    tools=[change_parameters]
-                ),
-                contents=_gemini_input
-            )
-            logger.info(f"Gemini followup response: {gemini_response}")
-            response = gemini_response.text
+                break
         yield response, build_output()
         
 
